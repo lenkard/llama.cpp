@@ -1289,6 +1289,46 @@ int main(int argc, char ** argv) {
         return r;
     };
 
+    // POST /v1/diffusion/preflight -- tokenize image markers and report the
+    // actual libmtmd-expanded prefix length without touching the decoder/KV cache.
+    http.Post("/v1/diffusion/preflight", [&](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try { body = json::parse(req.body); }
+        catch (const std::exception & e) { res.status = 400; res.set_content(error_json(std::string("invalid JSON: ") + e.what(), "invalid_request_error", 400).dump(), "application/json"); return; }
+        if (!srv.mctx_vision || !body.contains("multimodal_prompt") || !body["multimodal_prompt"].is_string() ||
+            !body.contains("images") || !body["images"].is_array() || body["images"].empty() || body["images"].size() > 6) {
+            res.status = 400; res.set_content(error_json("preflight requires multimodal_prompt and 1 to 6 images with a configured vision projector", "invalid_request_error", 400).dump(), "application/json"); return;
+        }
+        const int canvas = body.value("canvas_length", 0);
+        if (canvas < 1 || canvas > srv.canvas_length || canvas % 16 != 0) {
+            res.status = 400; res.set_content(error_json("canvas_length must be a multiple of 16 and not exceed 256", "invalid_request_error", 400).dump(), "application/json"); return;
+        }
+        std::vector<std::vector<unsigned char>> images;
+        for (const json & encoded : body["images"]) {
+            if (!encoded.is_string() || !decode_base64_image(encoded.get<std::string>(), &images.emplace_back()) || images.back().size() > 5 * 1024 * 1024) {
+                res.status = 400; res.set_content(error_json("images must be base64 PNG, JPEG or WebP data no larger than 5 MiB", "invalid_request_error", 400).dump(), "application/json"); return;
+            }
+        }
+        std::unique_lock<std::mutex> lock(srv.gen_mutex);
+        mtmd::bitmaps bitmaps;
+        for (const auto & image : images) {
+            auto decoded = mtmd_helper_bitmap_init_from_buf(srv.mctx_vision.get(), image.data(), image.size(), false);
+            if (!decoded.bitmap) { res.status = 400; res.set_content(error_json("multimodal image decode failed", "invalid_request_error", 400).dump(), "application/json"); return; }
+            bitmaps.entries.emplace_back(decoded.bitmap);
+        }
+        const std::string prompt = body["multimodal_prompt"].get<std::string>();
+        mtmd_input_text text{prompt.c_str(), true, true};
+        mtmd::input_chunks chunks(mtmd_input_chunks_init());
+        auto bitmap_ptrs = bitmaps.c_ptr();
+        if (mtmd_tokenize(srv.mctx_vision.get(), chunks.ptr.get(), &text, bitmap_ptrs.data(), bitmap_ptrs.size()) != 0) {
+            res.status = 400; res.set_content(error_json("multimodal prompt markers do not match images", "invalid_request_error", 400).dump(), "application/json"); return;
+        }
+        const int prompt_tokens = (int) mtmd_helper_get_n_pos(chunks.ptr.get());
+        res.set_content(json{{"object", "diffusion.preflight"}, {"prompt_tokens", prompt_tokens},
+                             {"canvas_length", canvas}, {"max_context_tokens", srv.n_ctx},
+                             {"fits_context", prompt_tokens + canvas <= srv.n_ctx}}.dump(), "application/json");
+    });
+
     // POST /v1/diffusion/reads -- private, non-OpenAI structured-read API.
     // It is intentionally separate from generation: it returns exact token-ID
     // logprobs after exactly one decoder pass and never emits a completion.
