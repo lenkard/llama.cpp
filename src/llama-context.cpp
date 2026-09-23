@@ -1226,23 +1226,22 @@ void llama_context::set_diffusion_self_cond_topk(const int32_t * ids, const floa
     diffusion_cond.sc_topk_probs.assign(probs, probs + n);
 }
 
-static ggml_backend_cuda_diffusion_sample_topk_t get_cuda_diffusion_sample_topk_proc(ggml_backend_t backend) {
-    if (!backend) {
-        return nullptr;
-    }
-
+static ggml_backend_reg_t get_backend_reg(ggml_backend_t backend) {
+    if (!backend) return nullptr;
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    if (!dev) {
-        return nullptr;
-    }
+    return dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+}
 
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    if (!reg) {
-        return nullptr;
-    }
+static ggml_backend_cuda_diffusion_sample_topk_t get_cuda_diffusion_sample_topk_proc(ggml_backend_t backend) {
+    auto * reg = get_backend_reg(backend);
+    return reg ? (ggml_backend_cuda_diffusion_sample_topk_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_diffusion_sample_topk") : nullptr;
+}
 
-    return (ggml_backend_cuda_diffusion_sample_topk_t)
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_diffusion_sample_topk");
+static ggml_backend_cuda_diffusion_read_logprobs_t get_cuda_diffusion_read_logprobs_proc(ggml_backend_t backend) {
+    auto * reg = get_backend_reg(backend);
+    return reg ? (ggml_backend_cuda_diffusion_read_logprobs_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_diffusion_read_logprobs") : nullptr;
 }
 
 static bool diffusion_decoder_inputs_device_ready(
@@ -1289,6 +1288,22 @@ bool llama_context::diffusion_sample_topk_supported() const {
         }
     }
     return false;
+}
+
+bool llama_context::diffusion_read_logprobs_supported() const {
+    for (ggml_backend_t backend : backend_ptrs) if (get_cuda_diffusion_read_logprobs_proc(backend)) return true;
+    return false;
+}
+
+bool llama_context::diffusion_read_logprobs(
+        int32_t n_tokens, const llama_token * requested_ids, int32_t n_requested_ids, float * out_logprobs) {
+    if (!gf_res_prev || !requested_ids || !out_logprobs) return false;
+    ggml_tensor * logits = gf_res_prev->get_logits();
+    if (!logits) return false;
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), logits);
+    auto proc = get_cuda_diffusion_read_logprobs_proc(backend);
+    return proc && proc(backend, logits, model.vocab_size(), n_tokens,
+                        (const int32_t *) requested_ids, n_requested_ids, out_logprobs);
 }
 
 void llama_context::set_diffusion_gpu_sampling(bool enabled) {
@@ -3958,6 +3973,16 @@ bool llama_diffusion_sample_topk(
         const llama_diffusion_sample_params * params,
         llama_diffusion_sample_result * result) {
     return ctx->diffusion_sample_topk(params, result);
+}
+
+bool llama_diffusion_read_logprobs_supported(llama_context * ctx) {
+    return ctx->diffusion_read_logprobs_supported();
+}
+
+bool llama_diffusion_read_logprobs(
+        llama_context * ctx, int32_t n_tokens, const llama_token * requested_ids,
+        int32_t n_requested_ids, float * out_logprobs) {
+    return ctx->diffusion_read_logprobs(n_tokens, requested_ids, n_requested_ids, out_logprobs);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

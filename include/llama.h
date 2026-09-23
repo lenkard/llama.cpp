@@ -1073,6 +1073,16 @@ extern "C" {
             const struct llama_diffusion_sample_params * params,
             struct llama_diffusion_sample_result * result);
 
+    // CUDA fast path for exact structured reads. Normalizes every vocabulary
+    // row on device and copies only requested token logprobs to the host.
+    LLAMA_API bool llama_diffusion_read_logprobs_supported(struct llama_context * ctx);
+    LLAMA_API bool llama_diffusion_read_logprobs(
+            struct llama_context * ctx,
+            int32_t n_tokens,
+            const llama_token * requested_ids,
+            int32_t n_requested_ids,
+            float * out_logprobs);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     //

@@ -5661,6 +5661,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_diffusion_sample_topk") == 0) {
         return (void *)ggml_cuda_diffusion_sample_topk;
     }
+    if (strcmp(name, "ggml_backend_cuda_diffusion_read_logprobs") == 0) {
+        return (void *)ggml_cuda_diffusion_read_logprobs;
+    }
     return nullptr;
 }
 

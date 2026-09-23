@@ -133,6 +133,9 @@ struct llama_context {
     void set_diffusion_self_cond_topk(const int32_t * ids, const float * probs, int64_t k, int64_t n_tokens);
 
     bool diffusion_sample_topk_supported() const;
+    bool diffusion_read_logprobs_supported() const;
+    bool diffusion_read_logprobs(int32_t n_tokens, const llama_token * requested_ids,
+                                 int32_t n_requested_ids, float * out_logprobs);
     void set_diffusion_gpu_sampling(bool enabled);
     bool diffusion_sample_topk(
             const llama_diffusion_sample_params * params,

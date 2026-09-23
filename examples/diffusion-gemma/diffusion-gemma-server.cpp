@@ -18,6 +18,8 @@
 #include "common.h"
 #include "llama.h"
 #include "log.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -196,6 +198,7 @@ struct diffusion_server {
     llama_memory_t      mem   = nullptr;
     llama_batch         batch{};
     common_chat_templates_ptr templates;
+    mtmd::context_ptr mctx_vision;
 
     int    canvas_length = DEF_CANVAS_LENGTH;
     int    n_steps       = DEF_MAX_DENOISE_STEPS;
@@ -607,6 +610,155 @@ struct diffusion_server {
         out.ok            = true;
         return out;
     }
+
+    // A single decoder pass for typed decision systems. Unlike generate(), this
+    // consumes a caller-provided canvas, never samples or commits it, and reports
+    // exact normalized log probabilities for a bounded set of vocabulary IDs.
+    struct read_result {
+        std::vector<std::vector<float>> logprobs;
+        int prompt_tokens = 0;
+        int canvas_tokens = 0;
+        double prefill_ms = 0.0;
+        double read_ms = 0.0;
+        bool ok = false;
+        std::string error;
+    };
+
+    read_result read_once(const std::vector<llama_token> & prompt_tokens,
+                          const std::vector<llama_token> & canvas,
+                          const std::vector<llama_token> & requested_ids,
+                          const std::string * multimodal_prompt = nullptr,
+                          const std::vector<std::vector<unsigned char>> * images = nullptr) {
+        read_result out;
+        int prefix_len = (int) prompt_tokens.size();
+        const int canvas_len = (int) canvas.size();
+        if (canvas_len < 1 || canvas_len > n_ub) {
+            out.error = "canvas length must be between 1 and " + std::to_string(n_ub);
+            return out;
+        }
+        if (prefix_len + canvas_len > n_ctx) {
+            out.error = "prompt and canvas exceed context (n_ctx=" + std::to_string(n_ctx) + ")";
+            return out;
+        }
+        if (requested_ids.empty()) {
+            out.error = "at least one requested token ID is required";
+            return out;
+        }
+
+        llama_memory_clear(mem, true);
+        int n_decode = 0;
+        const auto t_prefill0 = std::chrono::steady_clock::now();
+        if (images) {
+            if (!mctx_vision || !multimodal_prompt || images->empty()) {
+                out.error = "multimodal read requested but no vision projector is configured";
+                return out;
+            }
+            mtmd::bitmaps bitmaps;
+            for (const auto & image : *images) {
+                auto decoded = mtmd_helper_bitmap_init_from_buf(mctx_vision.get(), image.data(), image.size(), false);
+                if (!decoded.bitmap) {
+                    out.error = "multimodal image decode failed";
+                    return out;
+                }
+                bitmaps.entries.emplace_back(decoded.bitmap);
+            }
+            mtmd_input_text text{multimodal_prompt->c_str(), true, true};
+            mtmd::input_chunks chunks(mtmd_input_chunks_init());
+            auto bitmap_ptrs = bitmaps.c_ptr();
+            if (mtmd_tokenize(mctx_vision.get(), chunks.ptr.get(), &text,
+                              bitmap_ptrs.data(), bitmap_ptrs.size()) != 0) {
+                out.error = "multimodal prompt tokenization failed";
+                return out;
+            }
+            prefix_len = (int) mtmd_helper_get_n_pos(chunks.ptr.get());
+            if (prefix_len + canvas_len > n_ctx) {
+                out.error = "prompt, images and canvas exceed context (n_ctx=" + std::to_string(n_ctx) + ")";
+                return out;
+            }
+            llama_pos n_past = 0;
+            if (mtmd_helper_eval_chunks(mctx_vision.get(), ctx, chunks.ptr.get(), 0, 0, n_ub, true, &n_past)) {
+                out.error = "multimodal prompt prefill failed";
+                return out;
+            }
+        } else if (!prompt_tokens.empty() && !prefill_causal(prompt_tokens, 0, &n_decode)) {
+            out.error = "prompt prefill (encoder) decode failed";
+            return out;
+        }
+        out.prefill_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_prefill0).count();
+
+        llama_set_causal_attn(ctx, false);
+        llama_set_diffusion_decoder_phase(ctx, true);
+        llama_set_diffusion_gpu_sampling(ctx, false);
+        llama_set_diffusion_self_cond_topk(ctx, nullptr, nullptr, 0, 0);
+        batch.n_tokens = canvas_len;
+        for (int j = 0; j < canvas_len; ++j) {
+            batch.token[j] = canvas[j];
+            batch.pos[j] = prefix_len + j;
+            batch.n_seq_id[j] = 1;
+            batch.seq_id[j][0] = 0;
+            batch.logits[j] = 1;
+        }
+        const auto t_read0 = std::chrono::steady_clock::now();
+        const int decode_status = llama_decode(ctx, batch);
+        out.read_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_read0).count();
+        llama_memory_seq_rm(mem, 0, prefix_len, -1);
+        if (decode_status != 0) {
+            out.error = "read-only decoder pass failed";
+            return out;
+        }
+
+        out.logprobs.resize(canvas_len, std::vector<float>(requested_ids.size()));
+        // CUDA retains decoder logits on-device; normalize the complete vocabulary
+        // there and copy only the selected columns. CPU/non-CUDA uses the exact
+        // reference implementation below.
+        std::vector<float> cuda_logprobs((size_t) canvas_len * requested_ids.size());
+        const bool cuda_read = llama_diffusion_read_logprobs_supported(ctx) &&
+            llama_diffusion_read_logprobs(ctx, canvas_len, requested_ids.data(), (int32_t) requested_ids.size(),
+                                          cuda_logprobs.data());
+        if (cuda_read) {
+            for (int pos = 0; pos < canvas_len; ++pos) for (size_t id = 0; id < requested_ids.size(); ++id) {
+                const float value = cuda_logprobs[(size_t) pos * requested_ids.size() + id];
+                if (!std::isfinite(value)) {
+                    out.error = "decoder logsumexp failed";
+                    return out;
+                }
+                out.logprobs[pos][id] = value;
+            }
+        } else {
+            const float * logits = llama_get_logits(ctx);
+            if (!logits) {
+                out.error = "read-only decoder pass returned no logits";
+                return out;
+            }
+        for (int pos = 0; pos < canvas_len; ++pos) {
+            const float * row = logits + (size_t) pos * n_vocab;
+            float peak = -INFINITY;
+            for (int vocab = 0; vocab < n_vocab; ++vocab) {
+                if (!std::isfinite(row[vocab])) {
+                    out.error = "decoder returned non-finite logits";
+                    return out;
+                }
+                peak = std::max(peak, row[vocab]);
+            }
+            double sum = 0.0;
+            for (int vocab = 0; vocab < n_vocab; ++vocab) sum += std::exp((double) row[vocab] - peak);
+            if (!std::isfinite(sum) || sum <= 0.0) {
+                out.error = "decoder logsumexp failed";
+                return out;
+            }
+            const double log_z = peak + std::log(sum);
+            for (size_t id = 0; id < requested_ids.size(); ++id) {
+                out.logprobs[pos][id] = (float) ((double) row[requested_ids[id]] - log_z);
+            }
+        }
+        }
+        out.prompt_tokens = prefix_len;
+        out.canvas_tokens = canvas_len;
+        out.ok = true;
+        return out;
+    }
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -717,6 +869,57 @@ static diffusion_request request_from_body(const json & body, const diffusion_se
     return rq;
 }
 
+static bool decode_base64_image(const std::string & input, std::vector<unsigned char> * out) {
+    const std::string marker = ";base64,";
+    std::string data = input;
+    const size_t marker_at = input.find(marker);
+    if (input.rfind("data:image/", 0) == 0) {
+        if (marker_at == std::string::npos) return false;
+        data = input.substr(marker_at + marker.size());
+    }
+    static const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int value = 0, bits = -8;
+    out->clear();
+    for (unsigned char c : data) {
+        if (c == '=') break;
+        const size_t at = alphabet.find((char) c);
+        if (at == std::string::npos) return false;
+        value = (value << 6) | (int) at;
+        bits += 6;
+        if (bits >= 0) { out->push_back((unsigned char) ((value >> bits) & 0xff)); bits -= 8; }
+    }
+    return !out->empty();
+}
+
+static bool parse_token_array(const json & body, const char * name, int n_vocab,
+                              size_t max_count, bool allow_empty,
+                              std::vector<llama_token> * out, std::string * error) {
+    if (!body.contains(name) || !body[name].is_array()) {
+        *error = std::string("'") + name + "' (array) is required";
+        return false;
+    }
+    const json & values = body[name];
+    if ((!allow_empty && values.empty()) || values.size() > max_count) {
+        *error = std::string("'") + name + "' has an invalid length";
+        return false;
+    }
+    out->clear();
+    out->reserve(values.size());
+    for (const json & value : values) {
+        if (!value.is_number_integer()) {
+            *error = std::string("'") + name + "' must contain integer token IDs";
+            return false;
+        }
+        const int64_t token = value.get<int64_t>();
+        if (token < 0 || token >= n_vocab) {
+            *error = std::string("'") + name + "' contains a token outside the vocabulary";
+            return false;
+        }
+        out->push_back((llama_token) token);
+    }
+    return true;
+}
+
 // ------------------------------------------------------------------------------------------------
 int main(int argc, char ** argv) {
     std::string hostname = "127.0.0.1";
@@ -782,6 +985,19 @@ int main(int argc, char ** argv) {
         SRV_ERR("'%s' is not a diffusion model\n", params.model.path.c_str());
         llama_model_free(srv.model);
         return 1;
+    }
+
+    if (!params.mmproj.path.empty()) {
+        mtmd_context_params mparams = mtmd_context_params_default();
+        mparams.use_gpu = params.mmproj_use_gpu;
+        mparams.print_timings = false;
+        mparams.n_threads = params.cpuparams.n_threads;
+        srv.mctx_vision.reset(mtmd_init_from_file(params.mmproj.path.c_str(), srv.model, mparams));
+        if (!srv.mctx_vision) {
+            SRV_ERR("failed to load vision projector '%s'\n", params.mmproj.path.c_str());
+            llama_model_free(srv.model);
+            return 1;
+        }
     }
 
     srv.vocab         = llama_model_get_vocab(srv.model);
@@ -956,6 +1172,11 @@ int main(int argc, char ** argv) {
             {"n_ctx", srv.n_ctx},
             {"build_info", srv.build_info},
             {"generation_type", "block-diffusion"},
+            {"structured_read", {{"endpoint", "/v1/diffusion/reads"}, {"read_only", true},
+                                 {"decoder_passes", 1}, {"exact_requested_logprobs", true},
+                                 {"token_id_input", true}, {"images", srv.mctx_vision != nullptr},
+                                 {"max_canvas_length", srv.canvas_length}, {"canvas_multiple", 16},
+                                 {"max_logprob_token_ids", 512}}},
             {"endpoint_slots", enable_slots},
             {"endpoint_metrics", enable_metrics},
         };
@@ -1085,6 +1306,111 @@ int main(int argc, char ** argv) {
         if (r.ok) { srv.metrics.add(r); log_timings(r); }
         return r;
     };
+
+    // POST /v1/diffusion/preflight -- tokenize image markers and report the
+    // actual libmtmd-expanded prefix length without touching the decoder/KV cache.
+    http.Post("/v1/diffusion/preflight", [&](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try { body = json::parse(req.body); }
+        catch (const std::exception & e) { res.status = 400; res.set_content(error_json(std::string("invalid JSON: ") + e.what(), "invalid_request_error", 400).dump(), "application/json"); return; }
+        if (!srv.mctx_vision || !body.contains("multimodal_prompt") || !body["multimodal_prompt"].is_string() ||
+            !body.contains("images") || !body["images"].is_array() || body["images"].empty() || body["images"].size() > 6) {
+            res.status = 400; res.set_content(error_json("preflight requires multimodal_prompt and 1 to 6 images with a configured vision projector", "invalid_request_error", 400).dump(), "application/json"); return;
+        }
+        const int canvas = body.value("canvas_length", 0);
+        if (canvas < 1 || canvas > srv.canvas_length || canvas % 16 != 0) {
+            res.status = 400; res.set_content(error_json("canvas_length must be a multiple of 16 and not exceed 256", "invalid_request_error", 400).dump(), "application/json"); return;
+        }
+        std::vector<std::vector<unsigned char>> images;
+        for (const json & encoded : body["images"]) {
+            if (!encoded.is_string() || !decode_base64_image(encoded.get<std::string>(), &images.emplace_back()) || images.back().size() > 5 * 1024 * 1024) {
+                res.status = 400; res.set_content(error_json("images must be base64 PNG, JPEG or WebP data no larger than 5 MiB", "invalid_request_error", 400).dump(), "application/json"); return;
+            }
+        }
+        std::unique_lock<std::mutex> lock(srv.gen_mutex);
+        mtmd::bitmaps bitmaps;
+        for (const auto & image : images) {
+            auto decoded = mtmd_helper_bitmap_init_from_buf(srv.mctx_vision.get(), image.data(), image.size(), false);
+            if (!decoded.bitmap) { res.status = 400; res.set_content(error_json("multimodal image decode failed", "invalid_request_error", 400).dump(), "application/json"); return; }
+            bitmaps.entries.emplace_back(decoded.bitmap);
+        }
+        const std::string prompt = body["multimodal_prompt"].get<std::string>();
+        mtmd_input_text text{prompt.c_str(), true, true};
+        mtmd::input_chunks chunks(mtmd_input_chunks_init());
+        auto bitmap_ptrs = bitmaps.c_ptr();
+        if (mtmd_tokenize(srv.mctx_vision.get(), chunks.ptr.get(), &text, bitmap_ptrs.data(), bitmap_ptrs.size()) != 0) {
+            res.status = 400; res.set_content(error_json("multimodal prompt markers do not match images", "invalid_request_error", 400).dump(), "application/json"); return;
+        }
+        const int prompt_tokens = (int) mtmd_helper_get_n_pos(chunks.ptr.get());
+        res.set_content(json{{"object", "diffusion.preflight"}, {"prompt_tokens", prompt_tokens},
+                             {"canvas_length", canvas}, {"max_context_tokens", srv.n_ctx},
+                             {"fits_context", prompt_tokens + canvas <= srv.n_ctx}}.dump(), "application/json");
+    });
+
+    // POST /v1/diffusion/reads -- private, non-OpenAI structured-read API.
+    // It is intentionally separate from generation: it returns exact token-ID
+    // logprobs after exactly one decoder pass and never emits a completion.
+    http.Post("/v1/diffusion/reads", [&](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try { body = json::parse(req.body); }
+        catch (const std::exception & e) { res.status = 400; res.set_content(error_json(std::string("invalid JSON: ") + e.what(), "invalid_request_error", 400).dump(), "application/json"); return; }
+        if (body.value("read_only", false) != true || body.value("max_steps", 0) != 1) {
+            res.status = 400; res.set_content(error_json("structured reads require read_only=true and max_steps=1", "invalid_request_error", 400).dump(), "application/json"); return;
+        }
+        std::vector<llama_token> prompt_tokens, canvas, requested_ids;
+        std::string parse_error;
+        if (!parse_token_array(body, "prompt_token_ids", srv.n_vocab, (size_t) srv.n_ctx, true, &prompt_tokens, &parse_error) ||
+            !parse_token_array(body, "seed_canvas", srv.n_vocab, (size_t) srv.canvas_length, false, &canvas, &parse_error) ||
+            !parse_token_array(body, "logprob_token_ids", srv.n_vocab, 512, false, &requested_ids, &parse_error)) {
+            res.status = 400; res.set_content(error_json(parse_error, "invalid_request_error", 400).dump(), "application/json"); return;
+        }
+        std::string multimodal_prompt;
+        std::vector<std::vector<unsigned char>> images;
+        if (body.contains("images")) {
+            if (!body["images"].is_array() || body["images"].empty() || body["images"].size() > 6 ||
+                !body.contains("multimodal_prompt") || !body["multimodal_prompt"].is_string()) {
+                res.status = 400; res.set_content(error_json("images require a nonempty array (maximum 6) and multimodal_prompt", "invalid_request_error", 400).dump(), "application/json"); return;
+            }
+            multimodal_prompt = body["multimodal_prompt"].get<std::string>();
+            for (const json & encoded : body["images"]) {
+                if (!encoded.is_string() || !decode_base64_image(encoded.get<std::string>(), &images.emplace_back()) || images.back().size() > 5 * 1024 * 1024) {
+                    res.status = 400; res.set_content(error_json("images must be base64 PNG, JPEG or WebP data no larger than 5 MiB", "invalid_request_error", 400).dump(), "application/json"); return;
+                }
+            }
+        }
+        const int requested_canvas_length = body.value("canvas_length", 0);
+        if (requested_canvas_length != (int) canvas.size() || requested_canvas_length < 1 || requested_canvas_length > srv.canvas_length || requested_canvas_length % 16 != 0) {
+            res.status = 400; res.set_content(error_json("canvas_length must equal seed_canvas length, be a multiple of 16, and not exceed 256", "invalid_request_error", 400).dump(), "application/json"); return;
+        }
+        for (size_t i = 0; i < requested_ids.size(); ++i) {
+            for (size_t j = 0; j < i; ++j) if (requested_ids[i] == requested_ids[j]) {
+                res.status = 400; res.set_content(error_json("logprob_token_ids must be unique", "invalid_request_error", 400).dump(), "application/json"); return;
+            }
+        }
+
+        srv.metrics.n_processing.fetch_add(1);
+        std::unique_lock<std::mutex> lock(srv.gen_mutex);
+        const diffusion_server::read_result r = images.empty()
+            ? srv.read_once(prompt_tokens, canvas, requested_ids)
+            : srv.read_once(prompt_tokens, canvas, requested_ids, &multimodal_prompt, &images);
+        lock.unlock();
+        srv.metrics.n_processing.fetch_sub(1);
+        if (!r.ok) { res.status = 500; res.set_content(error_json(r.error, "server_error", 500).dump(), "application/json"); return; }
+
+        json positions = json::array();
+        for (const auto & row : r.logprobs) {
+            json scores = json::object();
+            for (size_t i = 0; i < requested_ids.size(); ++i) scores[std::to_string(requested_ids[i])] = row[i];
+            positions.push_back(std::move(scores));
+        }
+        json out{
+            {"object", "diffusion.read"}, {"id", gen_id("dread")}, {"model", srv.model_id},
+            {"logprobs", {{"positions", std::move(positions)}}},
+            {"usage", {{"prompt_tokens", r.prompt_tokens}, {"completion_tokens", r.canvas_tokens}, {"total_tokens", r.prompt_tokens + r.canvas_tokens}}},
+            {"timings", {{"prompt_ms", r.prefill_ms}, {"read_ms", r.read_ms}, {"decoder_passes", 1}}},
+        };
+        res.set_content(out.dump(), "application/json");
+    });
 
     // POST /v1/chat/completions
     http.Post("/v1/chat/completions", [&](const httplib::Request & req, httplib::Response & res) {
