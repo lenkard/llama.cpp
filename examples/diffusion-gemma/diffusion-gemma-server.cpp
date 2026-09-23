@@ -607,6 +607,103 @@ struct diffusion_server {
         out.ok            = true;
         return out;
     }
+
+    // A single decoder pass for typed decision systems. Unlike generate(), this
+    // consumes a caller-provided canvas, never samples or commits it, and reports
+    // exact normalized log probabilities for a bounded set of vocabulary IDs.
+    struct read_result {
+        std::vector<std::vector<float>> logprobs;
+        int prompt_tokens = 0;
+        int canvas_tokens = 0;
+        double prefill_ms = 0.0;
+        double read_ms = 0.0;
+        bool ok = false;
+        std::string error;
+    };
+
+    read_result read_once(const std::vector<llama_token> & prompt_tokens,
+                          const std::vector<llama_token> & canvas,
+                          const std::vector<llama_token> & requested_ids) {
+        read_result out;
+        const int prefix_len = (int) prompt_tokens.size();
+        const int canvas_len = (int) canvas.size();
+        if (canvas_len < 1 || canvas_len > n_ub) {
+            out.error = "canvas length must be between 1 and " + std::to_string(n_ub);
+            return out;
+        }
+        if (prefix_len + canvas_len > n_ctx) {
+            out.error = "prompt and canvas exceed context (n_ctx=" + std::to_string(n_ctx) + ")";
+            return out;
+        }
+        if (requested_ids.empty()) {
+            out.error = "at least one requested token ID is required";
+            return out;
+        }
+
+        llama_memory_clear(mem, true);
+        int n_decode = 0;
+        const auto t_prefill0 = std::chrono::steady_clock::now();
+        if (!prompt_tokens.empty() && !prefill_causal(prompt_tokens, 0, &n_decode)) {
+            out.error = "prompt prefill (encoder) decode failed";
+            return out;
+        }
+        out.prefill_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_prefill0).count();
+
+        llama_set_causal_attn(ctx, false);
+        llama_set_diffusion_decoder_phase(ctx, true);
+        llama_set_diffusion_gpu_sampling(ctx, false);
+        llama_set_diffusion_self_cond_topk(ctx, nullptr, nullptr, 0, 0);
+        batch.n_tokens = canvas_len;
+        for (int j = 0; j < canvas_len; ++j) {
+            batch.token[j] = canvas[j];
+            batch.pos[j] = prefix_len + j;
+            batch.n_seq_id[j] = 1;
+            batch.seq_id[j][0] = 0;
+            batch.logits[j] = 1;
+        }
+        const auto t_read0 = std::chrono::steady_clock::now();
+        const int decode_status = llama_decode(ctx, batch);
+        out.read_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_read0).count();
+        llama_memory_seq_rm(mem, 0, prefix_len, -1);
+        if (decode_status != 0) {
+            out.error = "read-only decoder pass failed";
+            return out;
+        }
+
+        const float * logits = llama_get_logits(ctx);
+        if (!logits) {
+            out.error = "read-only decoder pass returned no logits";
+            return out;
+        }
+        out.logprobs.resize(canvas_len, std::vector<float>(requested_ids.size()));
+        for (int pos = 0; pos < canvas_len; ++pos) {
+            const float * row = logits + (size_t) pos * n_vocab;
+            float peak = -INFINITY;
+            for (int vocab = 0; vocab < n_vocab; ++vocab) {
+                if (!std::isfinite(row[vocab])) {
+                    out.error = "decoder returned non-finite logits";
+                    return out;
+                }
+                peak = std::max(peak, row[vocab]);
+            }
+            double sum = 0.0;
+            for (int vocab = 0; vocab < n_vocab; ++vocab) sum += std::exp((double) row[vocab] - peak);
+            if (!std::isfinite(sum) || sum <= 0.0) {
+                out.error = "decoder logsumexp failed";
+                return out;
+            }
+            const double log_z = peak + std::log(sum);
+            for (size_t id = 0; id < requested_ids.size(); ++id) {
+                out.logprobs[pos][id] = (float) ((double) row[requested_ids[id]] - log_z);
+            }
+        }
+        out.prompt_tokens = prefix_len;
+        out.canvas_tokens = canvas_len;
+        out.ok = true;
+        return out;
+    }
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -715,6 +812,35 @@ static diffusion_request request_from_body(const json & body, const diffusion_se
     if (body.contains("seed")  && body["seed"].is_number_integer()) rq.seed = (uint32_t) body["seed"].get<int64_t>();
     if (body.contains("ignore_eos") && body["ignore_eos"].is_boolean()) rq.ignore_eos = body["ignore_eos"].get<bool>();
     return rq;
+}
+
+static bool parse_token_array(const json & body, const char * name, int n_vocab,
+                              size_t max_count, bool allow_empty,
+                              std::vector<llama_token> * out, std::string * error) {
+    if (!body.contains(name) || !body[name].is_array()) {
+        *error = std::string("'") + name + "' (array) is required";
+        return false;
+    }
+    const json & values = body[name];
+    if ((!allow_empty && values.empty()) || values.size() > max_count) {
+        *error = std::string("'") + name + "' has an invalid length";
+        return false;
+    }
+    out->clear();
+    out->reserve(values.size());
+    for (const json & value : values) {
+        if (!value.is_number_integer()) {
+            *error = std::string("'") + name + "' must contain integer token IDs";
+            return false;
+        }
+        const int64_t token = value.get<int64_t>();
+        if (token < 0 || token >= n_vocab) {
+            *error = std::string("'") + name + "' contains a token outside the vocabulary";
+            return false;
+        }
+        out->push_back((llama_token) token);
+    }
+    return true;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -956,6 +1082,11 @@ int main(int argc, char ** argv) {
             {"n_ctx", srv.n_ctx},
             {"build_info", srv.build_info},
             {"generation_type", "block-diffusion"},
+            {"structured_read", {{"endpoint", "/v1/diffusion/reads"}, {"read_only", true},
+                                 {"decoder_passes", 1}, {"exact_requested_logprobs", true},
+                                 {"token_id_input", true}, {"images", false},
+                                 {"max_canvas_length", srv.canvas_length}, {"canvas_multiple", 16},
+                                 {"max_logprob_token_ids", 512}}},
             {"endpoint_slots", enable_slots},
             {"endpoint_metrics", enable_metrics},
         };
@@ -1085,6 +1216,55 @@ int main(int argc, char ** argv) {
         if (r.ok) { srv.metrics.add(r); log_timings(r); }
         return r;
     };
+
+    // POST /v1/diffusion/reads -- private, non-OpenAI structured-read API.
+    // It is intentionally separate from generation: it returns exact token-ID
+    // logprobs after exactly one decoder pass and never emits a completion.
+    http.Post("/v1/diffusion/reads", [&](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try { body = json::parse(req.body); }
+        catch (const std::exception & e) { res.status = 400; res.set_content(error_json(std::string("invalid JSON: ") + e.what(), "invalid_request_error", 400).dump(), "application/json"); return; }
+        if (body.value("read_only", false) != true || body.value("max_steps", 0) != 1) {
+            res.status = 400; res.set_content(error_json("structured reads require read_only=true and max_steps=1", "invalid_request_error", 400).dump(), "application/json"); return;
+        }
+        std::vector<llama_token> prompt_tokens, canvas, requested_ids;
+        std::string parse_error;
+        if (!parse_token_array(body, "prompt_token_ids", srv.n_vocab, (size_t) srv.n_ctx, true, &prompt_tokens, &parse_error) ||
+            !parse_token_array(body, "seed_canvas", srv.n_vocab, (size_t) srv.canvas_length, false, &canvas, &parse_error) ||
+            !parse_token_array(body, "logprob_token_ids", srv.n_vocab, 512, false, &requested_ids, &parse_error)) {
+            res.status = 400; res.set_content(error_json(parse_error, "invalid_request_error", 400).dump(), "application/json"); return;
+        }
+        const int requested_canvas_length = body.value("canvas_length", 0);
+        if (requested_canvas_length != (int) canvas.size() || requested_canvas_length < 1 || requested_canvas_length > srv.canvas_length || requested_canvas_length % 16 != 0) {
+            res.status = 400; res.set_content(error_json("canvas_length must equal seed_canvas length, be a multiple of 16, and not exceed 256", "invalid_request_error", 400).dump(), "application/json"); return;
+        }
+        for (size_t i = 0; i < requested_ids.size(); ++i) {
+            for (size_t j = 0; j < i; ++j) if (requested_ids[i] == requested_ids[j]) {
+                res.status = 400; res.set_content(error_json("logprob_token_ids must be unique", "invalid_request_error", 400).dump(), "application/json"); return;
+            }
+        }
+
+        srv.metrics.n_processing.fetch_add(1);
+        std::unique_lock<std::mutex> lock(srv.gen_mutex);
+        const diffusion_server::read_result r = srv.read_once(prompt_tokens, canvas, requested_ids);
+        lock.unlock();
+        srv.metrics.n_processing.fetch_sub(1);
+        if (!r.ok) { res.status = 500; res.set_content(error_json(r.error, "server_error", 500).dump(), "application/json"); return; }
+
+        json positions = json::array();
+        for (const auto & row : r.logprobs) {
+            json scores = json::object();
+            for (size_t i = 0; i < requested_ids.size(); ++i) scores[std::to_string(requested_ids[i])] = row[i];
+            positions.push_back(std::move(scores));
+        }
+        json out{
+            {"object", "diffusion.read"}, {"id", gen_id("dread")}, {"model", srv.model_id},
+            {"logprobs", {{"positions", std::move(positions)}}},
+            {"usage", {{"prompt_tokens", r.prompt_tokens}, {"completion_tokens", r.canvas_tokens}, {"total_tokens", r.prompt_tokens + r.canvas_tokens}}},
+            {"timings", {{"prompt_ms", r.prefill_ms}, {"read_ms", r.read_ms}, {"decoder_passes", 1}}},
+        };
+        res.set_content(out.dump(), "application/json");
+    });
 
     // POST /v1/chat/completions
     http.Post("/v1/chat/completions", [&](const httplib::Request & req, httplib::Response & res) {
