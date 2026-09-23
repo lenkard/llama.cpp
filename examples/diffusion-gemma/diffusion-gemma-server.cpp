@@ -18,6 +18,8 @@
 #include "common.h"
 #include "llama.h"
 #include "log.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -196,6 +198,7 @@ struct diffusion_server {
     llama_memory_t      mem   = nullptr;
     llama_batch         batch{};
     common_chat_templates_ptr templates;
+    mtmd::context_ptr mctx_vision;
 
     int    canvas_length = DEF_CANVAS_LENGTH;
     int    n_steps       = DEF_MAX_DENOISE_STEPS;
@@ -623,9 +626,11 @@ struct diffusion_server {
 
     read_result read_once(const std::vector<llama_token> & prompt_tokens,
                           const std::vector<llama_token> & canvas,
-                          const std::vector<llama_token> & requested_ids) {
+                          const std::vector<llama_token> & requested_ids,
+                          const std::string * multimodal_prompt = nullptr,
+                          const std::vector<std::vector<unsigned char>> * images = nullptr) {
         read_result out;
-        const int prefix_len = (int) prompt_tokens.size();
+        int prefix_len = (int) prompt_tokens.size();
         const int canvas_len = (int) canvas.size();
         if (canvas_len < 1 || canvas_len > n_ub) {
             out.error = "canvas length must be between 1 and " + std::to_string(n_ub);
@@ -643,7 +648,39 @@ struct diffusion_server {
         llama_memory_clear(mem, true);
         int n_decode = 0;
         const auto t_prefill0 = std::chrono::steady_clock::now();
-        if (!prompt_tokens.empty() && !prefill_causal(prompt_tokens, 0, &n_decode)) {
+        if (images) {
+            if (!mctx_vision || !multimodal_prompt || images->empty()) {
+                out.error = "multimodal read requested but no vision projector is configured";
+                return out;
+            }
+            mtmd::bitmaps bitmaps;
+            for (const auto & image : *images) {
+                auto decoded = mtmd_helper_bitmap_init_from_buf(mctx_vision.get(), image.data(), image.size(), false);
+                if (!decoded.bitmap) {
+                    out.error = "multimodal image decode failed";
+                    return out;
+                }
+                bitmaps.entries.emplace_back(decoded.bitmap);
+            }
+            mtmd_input_text text{multimodal_prompt->c_str(), true, true};
+            mtmd::input_chunks chunks(mtmd_input_chunks_init());
+            auto bitmap_ptrs = bitmaps.c_ptr();
+            if (mtmd_tokenize(mctx_vision.get(), chunks.ptr.get(), &text,
+                              bitmap_ptrs.data(), bitmap_ptrs.size()) != 0) {
+                out.error = "multimodal prompt tokenization failed";
+                return out;
+            }
+            prefix_len = (int) mtmd_helper_get_n_pos(chunks.ptr.get());
+            if (prefix_len + canvas_len > n_ctx) {
+                out.error = "prompt, images and canvas exceed context (n_ctx=" + std::to_string(n_ctx) + ")";
+                return out;
+            }
+            llama_pos n_past = 0;
+            if (mtmd_helper_eval_chunks(mctx_vision.get(), ctx, chunks.ptr.get(), 0, 0, n_ub, true, &n_past)) {
+                out.error = "multimodal prompt prefill failed";
+                return out;
+            }
+        } else if (!prompt_tokens.empty() && !prefill_causal(prompt_tokens, 0, &n_decode)) {
             out.error = "prompt prefill (encoder) decode failed";
             return out;
         }
@@ -814,6 +851,28 @@ static diffusion_request request_from_body(const json & body, const diffusion_se
     return rq;
 }
 
+static bool decode_base64_image(const std::string & input, std::vector<unsigned char> * out) {
+    const std::string marker = ";base64,";
+    std::string data = input;
+    const size_t marker_at = input.find(marker);
+    if (input.rfind("data:image/", 0) == 0) {
+        if (marker_at == std::string::npos) return false;
+        data = input.substr(marker_at + marker.size());
+    }
+    static const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int value = 0, bits = -8;
+    out->clear();
+    for (unsigned char c : data) {
+        if (c == '=') break;
+        const size_t at = alphabet.find((char) c);
+        if (at == std::string::npos) return false;
+        value = (value << 6) | (int) at;
+        bits += 6;
+        if (bits >= 0) { out->push_back((unsigned char) ((value >> bits) & 0xff)); bits -= 8; }
+    }
+    return !out->empty();
+}
+
 static bool parse_token_array(const json & body, const char * name, int n_vocab,
                               size_t max_count, bool allow_empty,
                               std::vector<llama_token> * out, std::string * error) {
@@ -908,6 +967,19 @@ int main(int argc, char ** argv) {
         SRV_ERR("'%s' is not a diffusion model\n", params.model.path.c_str());
         llama_model_free(srv.model);
         return 1;
+    }
+
+    if (!params.mmproj.path.empty()) {
+        mtmd_context_params mparams = mtmd_context_params_default();
+        mparams.use_gpu = params.mmproj_use_gpu;
+        mparams.print_timings = false;
+        mparams.n_threads = params.cpuparams.n_threads;
+        srv.mctx_vision.reset(mtmd_init_from_file(params.mmproj.path.c_str(), srv.model, mparams));
+        if (!srv.mctx_vision) {
+            SRV_ERR("failed to load vision projector '%s'\n", params.mmproj.path.c_str());
+            llama_model_free(srv.model);
+            return 1;
+        }
     }
 
     srv.vocab         = llama_model_get_vocab(srv.model);
@@ -1084,7 +1156,7 @@ int main(int argc, char ** argv) {
             {"generation_type", "block-diffusion"},
             {"structured_read", {{"endpoint", "/v1/diffusion/reads"}, {"read_only", true},
                                  {"decoder_passes", 1}, {"exact_requested_logprobs", true},
-                                 {"token_id_input", true}, {"images", false},
+                                 {"token_id_input", true}, {"images", srv.mctx_vision != nullptr},
                                  {"max_canvas_length", srv.canvas_length}, {"canvas_multiple", 16},
                                  {"max_logprob_token_ids", 512}}},
             {"endpoint_slots", enable_slots},
@@ -1234,6 +1306,20 @@ int main(int argc, char ** argv) {
             !parse_token_array(body, "logprob_token_ids", srv.n_vocab, 512, false, &requested_ids, &parse_error)) {
             res.status = 400; res.set_content(error_json(parse_error, "invalid_request_error", 400).dump(), "application/json"); return;
         }
+        std::string multimodal_prompt;
+        std::vector<std::vector<unsigned char>> images;
+        if (body.contains("images")) {
+            if (!body["images"].is_array() || body["images"].empty() || body["images"].size() > 6 ||
+                !body.contains("multimodal_prompt") || !body["multimodal_prompt"].is_string()) {
+                res.status = 400; res.set_content(error_json("images require a nonempty array (maximum 6) and multimodal_prompt", "invalid_request_error", 400).dump(), "application/json"); return;
+            }
+            multimodal_prompt = body["multimodal_prompt"].get<std::string>();
+            for (const json & encoded : body["images"]) {
+                if (!encoded.is_string() || !decode_base64_image(encoded.get<std::string>(), &images.emplace_back()) || images.back().size() > 5 * 1024 * 1024) {
+                    res.status = 400; res.set_content(error_json("images must be base64 PNG, JPEG or WebP data no larger than 5 MiB", "invalid_request_error", 400).dump(), "application/json"); return;
+                }
+            }
+        }
         const int requested_canvas_length = body.value("canvas_length", 0);
         if (requested_canvas_length != (int) canvas.size() || requested_canvas_length < 1 || requested_canvas_length > srv.canvas_length || requested_canvas_length % 16 != 0) {
             res.status = 400; res.set_content(error_json("canvas_length must equal seed_canvas length, be a multiple of 16, and not exceed 256", "invalid_request_error", 400).dump(), "application/json"); return;
@@ -1246,7 +1332,9 @@ int main(int argc, char ** argv) {
 
         srv.metrics.n_processing.fetch_add(1);
         std::unique_lock<std::mutex> lock(srv.gen_mutex);
-        const diffusion_server::read_result r = srv.read_once(prompt_tokens, canvas, requested_ids);
+        const diffusion_server::read_result r = images.empty()
+            ? srv.read_once(prompt_tokens, canvas, requested_ids)
+            : srv.read_once(prompt_tokens, canvas, requested_ids, &multimodal_prompt, &images);
         lock.unlock();
         srv.metrics.n_processing.fetch_sub(1);
         if (!r.ok) { res.status = 500; res.set_content(error_json(r.error, "server_error", 500).dump(), "application/json"); return; }
