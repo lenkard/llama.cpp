@@ -1302,7 +1302,7 @@ bool llama_context::diffusion_read_logprobs(
     if (!logits) return false;
     ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), logits);
     auto proc = get_cuda_diffusion_read_logprobs_proc(backend);
-    return proc && proc(backend, logits, model.vocab_size(), n_tokens,
+    return proc && proc(backend, logits, (int32_t) model.vocab.n_tokens(), n_tokens,
                         (const int32_t *) requested_ids, n_requested_ids, out_logprobs);
 }
 
