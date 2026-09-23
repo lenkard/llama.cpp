@@ -621,6 +621,7 @@ struct diffusion_server {
         double prefill_ms = 0.0;
         double read_ms = 0.0;
         bool ok = false;
+        bool cuda_logprob_normalization = false;
         std::string error;
     };
 
@@ -718,6 +719,7 @@ struct diffusion_server {
             llama_diffusion_read_logprobs(ctx, canvas_len, requested_ids.data(), (int32_t) requested_ids.size(),
                                           cuda_logprobs.data());
         if (cuda_read) {
+            out.cuda_logprob_normalization = true;
             for (int pos = 0; pos < canvas_len; ++pos) for (size_t id = 0; id < requested_ids.size(); ++id) {
                 const float value = cuda_logprobs[(size_t) pos * requested_ids.size() + id];
                 if (!std::isfinite(value)) {
@@ -1407,7 +1409,8 @@ int main(int argc, char ** argv) {
             {"object", "diffusion.read"}, {"id", gen_id("dread")}, {"model", srv.model_id},
             {"logprobs", {{"positions", std::move(positions)}}},
             {"usage", {{"prompt_tokens", r.prompt_tokens}, {"completion_tokens", r.canvas_tokens}, {"total_tokens", r.prompt_tokens + r.canvas_tokens}}},
-            {"timings", {{"prompt_ms", r.prefill_ms}, {"read_ms", r.read_ms}, {"decoder_passes", 1}}},
+            {"timings", {{"prompt_ms", r.prefill_ms}, {"read_ms", r.read_ms}, {"decoder_passes", 1},
+                         {"cuda_logprob_normalization", r.cuda_logprob_normalization}}},
         };
         res.set_content(out.dump(), "application/json");
     });
