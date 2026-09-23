@@ -89,6 +89,17 @@ typedef bool (*ggml_backend_cuda_diffusion_sample_topk_t)(
         const struct ggml_cuda_diffusion_sample_params * params,
         struct ggml_cuda_diffusion_sample_result * result);
 
+// Exact full-vocabulary normalization plus a bounded requested-token gather.
+// Input IDs and output logprobs are host-resident; logits remain on CUDA.
+typedef bool (*ggml_backend_cuda_diffusion_read_logprobs_t)(
+        ggml_backend_t backend,
+        const struct ggml_tensor * logits,
+        int32_t n_vocab,
+        int32_t n_tokens,
+        const int32_t * requested_ids,
+        int32_t n_requested_ids,
+        float * out_logprobs);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
 #ifdef  __cplusplus

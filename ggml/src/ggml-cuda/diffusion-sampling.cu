@@ -1345,3 +1345,61 @@ bool ggml_cuda_diffusion_sample_topk(
     }
     return true;
 }
+
+// One block per decoder position. Each block scans the entire vocabulary twice:
+// first for the maximum and then for exp(logit - max). This is exact full-vocab
+// normalization; only the requested token columns cross the device boundary.
+static __global__ void diffusion_read_logprobs_kernel(
+        const float * logits, const int32_t * ids, float * out,
+        int n_vocab, int n_requested) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    extern __shared__ float reduce[];
+    const float * values = logits + (size_t) row * n_vocab;
+    float peak = -INFINITY;
+    for (int i = tid; i < n_vocab; i += blockDim.x) peak = fmaxf(peak, values[i]);
+    reduce[tid] = peak;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (tid < stride) reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+        __syncthreads();
+    }
+    peak = reduce[0];
+    float sum = 0.0f;
+    for (int i = tid; i < n_vocab; i += blockDim.x) sum += expf(values[i] - peak);
+    reduce[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (tid < stride) reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+    const float log_z = peak + logf(reduce[0]);
+    for (int i = tid; i < n_requested; i += blockDim.x) out[(size_t) row * n_requested + i] = values[ids[i]] - log_z;
+}
+
+bool ggml_cuda_diffusion_read_logprobs(
+        ggml_backend_t backend, const ggml_tensor * logits, int32_t n_vocab, int32_t n_tokens,
+        const int32_t * requested_ids, int32_t n_requested_ids, float * out_logprobs) {
+    if (!backend || !logits || !requested_ids || !out_logprobs || n_vocab <= 0 || n_tokens <= 0 ||
+            n_requested_ids <= 0 || logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits) ||
+            logits->ne[0] != n_vocab || ggml_nrows(logits) < n_tokens || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    for (int i = 0; i < n_requested_ids; ++i) if (requested_ids[i] < 0 || requested_ids[i] >= n_vocab) return false;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    cudaStream_t stream = ctx->stream();
+    int32_t * ids_d = nullptr;
+    float * out_d = nullptr;
+    CUDA_CHECK(cudaMalloc(&ids_d, (size_t) n_requested_ids * sizeof(*ids_d)));
+    CUDA_CHECK(cudaMalloc(&out_d, (size_t) n_tokens * n_requested_ids * sizeof(*out_d)));
+    CUDA_CHECK(cudaMemcpyAsync(ids_d, requested_ids, (size_t) n_requested_ids * sizeof(*ids_d), cudaMemcpyHostToDevice, stream));
+    diffusion_read_logprobs_kernel<<<n_tokens, 256, 256 * sizeof(float), stream>>>(
+        (const float *) logits->data, ids_d, out_d, n_vocab, n_requested_ids);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(out_logprobs, out_d, (size_t) n_tokens * n_requested_ids * sizeof(*out_d), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(ids_d));
+    CUDA_CHECK(cudaFree(out_d));
+    return true;
+}

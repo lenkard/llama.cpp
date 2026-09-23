@@ -709,12 +709,29 @@ struct diffusion_server {
             return out;
         }
 
-        const float * logits = llama_get_logits(ctx);
-        if (!logits) {
-            out.error = "read-only decoder pass returned no logits";
-            return out;
-        }
         out.logprobs.resize(canvas_len, std::vector<float>(requested_ids.size()));
+        // CUDA retains decoder logits on-device; normalize the complete vocabulary
+        // there and copy only the selected columns. CPU/non-CUDA uses the exact
+        // reference implementation below.
+        std::vector<float> cuda_logprobs((size_t) canvas_len * requested_ids.size());
+        const bool cuda_read = llama_diffusion_read_logprobs_supported(ctx) &&
+            llama_diffusion_read_logprobs(ctx, canvas_len, requested_ids.data(), (int32_t) requested_ids.size(),
+                                          cuda_logprobs.data());
+        if (cuda_read) {
+            for (int pos = 0; pos < canvas_len; ++pos) for (size_t id = 0; id < requested_ids.size(); ++id) {
+                const float value = cuda_logprobs[(size_t) pos * requested_ids.size() + id];
+                if (!std::isfinite(value)) {
+                    out.error = "decoder logsumexp failed";
+                    return out;
+                }
+                out.logprobs[pos][id] = value;
+            }
+        } else {
+            const float * logits = llama_get_logits(ctx);
+            if (!logits) {
+                out.error = "read-only decoder pass returned no logits";
+                return out;
+            }
         for (int pos = 0; pos < canvas_len; ++pos) {
             const float * row = logits + (size_t) pos * n_vocab;
             float peak = -INFINITY;
@@ -735,6 +752,7 @@ struct diffusion_server {
             for (size_t id = 0; id < requested_ids.size(); ++id) {
                 out.logprobs[pos][id] = (float) ((double) row[requested_ids[id]] - log_z);
             }
+        }
         }
         out.prompt_tokens = prefix_len;
         out.canvas_tokens = canvas_len;
